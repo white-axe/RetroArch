@@ -97,8 +97,13 @@ static unsigned sw_sws_threads;
 static video_buffer_t *video_buffer;
 static tpool_t *tpool;
 
+#ifndef FFMPEG3
 #define FFMPEG3 ((LIBAVUTIL_VERSION_INT < (56, 6, 100)) || \
       (LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58, 10, 100)))
+#endif
+#ifndef FFMPEG8
+#define FFMPEG8 (LIBAVCODEC_VERSION_MAJOR >= 62)
+#endif
 
 #if ENABLE_HW_ACCEL
 static enum AVHWDeviceType hw_decoder;
@@ -2088,17 +2093,28 @@ void CORE_PREFIX(retro_unload_game)(void)
 
    for (i = 0; i < MAX_STREAMS; i++)
    {
+#if FFMPEG8
+      if (sctx[i])
+         avcodec_free_context(&sctx[i]);
+      if (actx[i])
+         avcodec_free_context(&actx[i]);
+#else
       if (sctx[i])
          avcodec_close(sctx[i]);
       if (actx[i])
          avcodec_close(actx[i]);
+#endif
       sctx[i] = NULL;
       actx[i] = NULL;
    }
 
    if (vctx)
    {
+#if FFMPEG8
+      avcodec_free_context(&vctx);
+#else
       avcodec_close(vctx);
+#endif
       vctx = NULL;
    }
 
