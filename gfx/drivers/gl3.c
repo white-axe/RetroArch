@@ -766,7 +766,13 @@ static void gfx_display_gl3_blend_begin(void *data)
 
    glEnable(GL_BLEND);
    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-   glUseProgram(gl->pipelines.alpha_blend);
+
+   if (gl->chain.active)
+      gl->chain.shader->use(gl, gl->chain.shader_data, VIDEO_SHADER_STOCK_BLEND, true);
+#ifdef HAVE_SLANG
+   else
+      glUseProgram(gl->pipelines.alpha_blend);
+#endif
 }
 
 static void gfx_display_gl3_blend_end(void *data)
@@ -955,34 +961,58 @@ static void gl3_raster_font_draw_vertices(gl3_t *gl,
       font->atlas->dirty   = false;
    }
 
-   glActiveTexture(GL_TEXTURE1);
-   glBindTexture(GL_TEXTURE_2D, font->tex);
+   if (gl->chain.active)
+   {
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, font->tex);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_ONE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_ONE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_ONE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_RED);
 
-   if (gl->pipelines.font_loc.flat_ubo_vertex >= 0)
-      glUniform4fv(gl->pipelines.font_loc.flat_ubo_vertex,
-                   4, gl->mvp_no_rot.data);
+      gl->chain.shader->set_coords(gl->chain.shader_data, coords);
+      gl->chain.shader->set_mvp(gl->chain.shader_data, &gl->mvp_no_rot);
 
-   glEnableVertexAttribArray(0);
-   glEnableVertexAttribArray(1);
-   glEnableVertexAttribArray(2);
+      glDrawArrays(GL_TRIANGLES, 0, coords->vertices);
+   }
+#ifdef HAVE_SLANG
+   else
+   {
+      glActiveTexture(GL_TEXTURE1);
+      glBindTexture(GL_TEXTURE_2D, font->tex);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_GREEN);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_BLUE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ALPHA);
 
-   gl3_bind_scratch_vbo(gl, coords->vertex,
-         2 * sizeof(float)  * coords->vertices);
-   glVertexAttribPointer(0, 2,
-         GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)(uintptr_t)0);
-   gl3_bind_scratch_vbo(gl, coords->tex_coord,
-         2 * sizeof(float)  * coords->vertices);
-   glVertexAttribPointer(1, 2,
-         GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)(uintptr_t)0);
-   gl3_bind_scratch_vbo(gl, coords->color,
-         4 * sizeof(float) * coords->vertices);
-   glVertexAttribPointer(2, 4,
-         GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(uintptr_t)0);
+      if (gl->pipelines.font_loc.flat_ubo_vertex >= 0)
+         glUniform4fv(gl->pipelines.font_loc.flat_ubo_vertex,
+                      4, gl->mvp_no_rot.data);
 
-   glDrawArrays(GL_TRIANGLES, 0, coords->vertices);
-   glDisableVertexAttribArray(0);
-   glDisableVertexAttribArray(1);
-   glDisableVertexAttribArray(2);
+      glEnableVertexAttribArray(0);
+      glEnableVertexAttribArray(1);
+      glEnableVertexAttribArray(2);
+
+      gl3_bind_scratch_vbo(gl, coords->vertex,
+            2 * sizeof(float)  * coords->vertices);
+      glVertexAttribPointer(0, 2,
+            GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)(uintptr_t)0);
+      gl3_bind_scratch_vbo(gl, coords->tex_coord,
+            2 * sizeof(float)  * coords->vertices);
+      glVertexAttribPointer(1, 2,
+            GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)(uintptr_t)0);
+      gl3_bind_scratch_vbo(gl, coords->color,
+            4 * sizeof(float) * coords->vertices);
+      glVertexAttribPointer(2, 4,
+            GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(uintptr_t)0);
+
+      glDrawArrays(GL_TRIANGLES, 0, coords->vertices);
+      glDisableVertexAttribArray(0);
+      glDisableVertexAttribArray(1);
+      glDisableVertexAttribArray(2);
+   }
+#endif
+
    glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
