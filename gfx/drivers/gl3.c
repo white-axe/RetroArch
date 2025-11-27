@@ -1155,7 +1155,16 @@ static void gl3_raster_font_setup_viewport(
    glEnable(GL_BLEND);
    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
    glBlendEquation(GL_FUNC_ADD);
-   glUseProgram(gl->pipelines.font);
+
+   if (gl->chain.active)
+   {
+      if (gl->chain.shader && gl->chain.shader->use)
+         gl->chain.shader->use(gl, gl->chain.shader_data, VIDEO_SHADER_STOCK_BLEND, true);
+   }
+#ifdef HAVE_SLANG
+   else
+      glUseProgram(gl->pipelines.font);
+#endif
 }
 
 static void gl3_raster_font_render_msg(
@@ -1983,44 +1992,51 @@ static bool gl3_init_pipelines(gl3_t *gl)
       ;
 #endif /* HAVE_SHADERPIPELINE */
 
-   gl->pipelines.alpha_blend = gl3_cross_compile_program(alpha_blend_vert, sizeof(alpha_blend_vert),
+   if (!gl->pipelines.alpha_blend)
+      gl->pipelines.alpha_blend = gl3_cross_compile_program(alpha_blend_vert, sizeof(alpha_blend_vert),
                                                              alpha_blend_frag, sizeof(alpha_blend_frag),
                                                              &gl->pipelines.alpha_blend_loc, true);
    if (!gl->pipelines.alpha_blend)
       return false;
 
 #ifdef HAVE_SHADERPIPELINE
-   gl->pipelines.font = gl3_cross_compile_program(alpha_blend_vert, sizeof(alpha_blend_vert),
+   if (!gl->pipelines.font)
+      gl->pipelines.font = gl3_cross_compile_program(alpha_blend_vert, sizeof(alpha_blend_vert),
                                                       font_frag, sizeof(font_frag),
                                                       &gl->pipelines.font_loc, true);
    if (!gl->pipelines.font)
       return false;
 
-   gl->pipelines.ribbon_simple = gl3_cross_compile_program(pipeline_ribbon_simple_vert, sizeof(pipeline_ribbon_simple_vert),
+   if (!gl->pipelines.ribbon_simple)
+      gl->pipelines.ribbon_simple = gl3_cross_compile_program(pipeline_ribbon_simple_vert, sizeof(pipeline_ribbon_simple_vert),
                                                                pipeline_ribbon_simple_frag, sizeof(pipeline_ribbon_simple_frag),
                                                                &gl->pipelines.ribbon_simple_loc, true);
    if (!gl->pipelines.ribbon_simple)
       return false;
 
-   gl->pipelines.ribbon = gl3_cross_compile_program(pipeline_ribbon_vert, sizeof(pipeline_ribbon_vert),
+   if (!gl->pipelines.ribbon)
+      gl->pipelines.ribbon = gl3_cross_compile_program(pipeline_ribbon_vert, sizeof(pipeline_ribbon_vert),
                                                         pipeline_ribbon_frag, sizeof(pipeline_ribbon_frag),
                                                         &gl->pipelines.ribbon_loc, true);
    if (!gl->pipelines.ribbon)
       return false;
 
-   gl->pipelines.bokeh = gl3_cross_compile_program(alpha_blend_vert, sizeof(alpha_blend_vert),
+   if (!gl->pipelines.bokeh)
+      gl->pipelines.bokeh = gl3_cross_compile_program(alpha_blend_vert, sizeof(alpha_blend_vert),
                                                        pipeline_bokeh_frag, sizeof(pipeline_bokeh_frag),
                                                        &gl->pipelines.bokeh_loc, true);
    if (!gl->pipelines.bokeh)
       return false;
 
-   gl->pipelines.snow_simple = gl3_cross_compile_program(alpha_blend_vert, sizeof(alpha_blend_vert),
+   if (!gl->pipelines.snow_simple)
+      gl->pipelines.snow_simple = gl3_cross_compile_program(alpha_blend_vert, sizeof(alpha_blend_vert),
                                                              pipeline_snow_simple_frag, sizeof(pipeline_snow_simple_frag),
                                                              &gl->pipelines.snow_simple_loc, true);
    if (!gl->pipelines.snow_simple)
       return false;
 
-   gl->pipelines.snow = gl3_cross_compile_program(alpha_blend_vert, sizeof(alpha_blend_vert),
+   if (!gl->pipelines.snow)
+      gl->pipelines.snow = gl3_cross_compile_program(alpha_blend_vert, sizeof(alpha_blend_vert),
                                                       pipeline_snow_frag, sizeof(pipeline_snow_frag),
                                                       &gl->pipelines.snow_loc, true);
    if (!gl->pipelines.snow)
