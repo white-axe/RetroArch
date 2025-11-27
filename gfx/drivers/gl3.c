@@ -3685,7 +3685,9 @@ static bool gl3_frame(void *data, const void *frame,
 {
    struct gl3_filter_chain_texture texture;
    struct gl3_streamed_texture *streamed   = NULL;
+#ifdef HAVE_SLANG
    gl3_filter_chain_t *filter_chain        = NULL;
+#endif
    gl3_t *gl                               = (gl3_t*)data;
    unsigned width                          = video_info->width;
    unsigned height                         = video_info->height;
@@ -3697,7 +3699,7 @@ static bool gl3_frame(void *data, const void *frame,
    bool msg_bgcolor_enable                 = video_info->msg_bgcolor_enable;
 #endif
    int bfi_light_frames;
-   int i;
+   unsigned i;
    unsigned n;
    unsigned hard_sync_frames               = video_info->hard_sync_frames;
    bool input_driver_nonblock_state        = video_info->input_driver_nonblock_state;
@@ -3717,32 +3719,19 @@ static bool gl3_frame(void *data, const void *frame,
       gl->ctx_driver->bind_hw_render(gl->ctx_data, false);
    glBindVertexArray(gl->vao);
 
+   if (gl->chain.active)
+      gl->chain.shader->use(gl, gl->chain.shader_data, 1, true);
+
+#ifdef IOS
+   /* Apparently the viewport is lost each frame, thanks Apple. */
+   gl3_set_viewport(gl, width, height, false, true);
+#endif
+
    if (frame)
       gl->textures_index = (gl->textures_index + 1)
          & (GL_CORE_NUM_TEXTURES - 1);
 
    streamed = &gl->textures[gl->textures_index];
-   if (frame)
-   {
-      if (gl->flags & GL3_FLAG_HW_RENDER_ENABLE)
-      {
-         streamed->width    = frame_width;
-         streamed->height   = frame_height;
-      }
-      else
-         gl3_update_cpu_texture(gl, streamed, frame,
-               frame_width, frame_height, pitch);
-   }
-
-   if (gl->flags & GL3_FLAG_SHOULD_RESIZE)
-   {
-      if (gl->ctx_driver->set_resize)
-         gl->ctx_driver->set_resize(gl->ctx_data,
-               width, height);
-      gl->flags            &= ~GL3_FLAG_SHOULD_RESIZE;
-   }
-
-   gl3_set_viewport(gl, width, height, false, true);
 
    texture.image            = 0;
    texture.width            = streamed->width;
@@ -3771,91 +3760,294 @@ static bool gl3_frame(void *data, const void *frame,
       texture.padded_height = streamed->height;
    }
 
-   /* Fast toggle shader filter chain logic */
-   filter_chain = gl->filter_chain;
-
-   if (!video_info->shader_active && gl->filter_chain != gl->filter_chain_default)
+   /* Render to texture in first pass. */
+   if (gl->chain.active && gl->chain.num_fbo_passes != 0)
    {
-      if (!gl->filter_chain_default)
-         gl3_init_default_filter_chain(gl);
+      gl3_renderchain_recompute_pass_sizes(gl,
+            frame_width, frame_height,
+            gl->out_vp_width, gl->out_vp_height);
 
-      if (gl->filter_chain_default)
-         filter_chain = gl->filter_chain_default;
+      gl3_renderchain_start_render(gl);
+   }
+
+   if (frame)
+   {
+      if (gl->flags & GL3_FLAG_HW_RENDER_ENABLE)
+      {
+         streamed->width    = frame_width;
+         streamed->height   = frame_height;
+      }
       else
-         return false;
+      {
+         if (gl->chain.active)
+            gl3_update_input_size(gl, frame_width, frame_height);
+
+         gl3_update_cpu_texture(gl, streamed, frame,
+               frame_width, frame_height, pitch);
+      }
+
+      /* No point regenerating mipmaps
+       * if there are no new frames. */
+      if (gl->chain.mipmap_active)
+      {
+         glBindTexture(GL_TEXTURE_2D, texture.image);
+         glGenerateMipmap(GL_TEXTURE_2D);
+         glBindTexture(GL_TEXTURE_2D, 0);
+      }
    }
 
-   if (!filter_chain && gl->filter_chain_default)
-      filter_chain = gl->filter_chain_default;
-
-   gl3_filter_chain_set_frame_count(filter_chain, frame_count);
-#ifdef HAVE_REWIND
-   gl3_filter_chain_set_frame_direction(filter_chain, state_manager_frame_is_reversed() ? -1 : 1);
-#else
-   gl3_filter_chain_set_frame_direction(filter_chain, 1);
-#endif
-   gl3_filter_chain_set_frame_time_delta(filter_chain, (uint32_t)video_driver_get_frame_time_delta_usec());
-
-   gl3_filter_chain_set_original_fps(filter_chain, video_driver_get_original_fps());
-
-   gl3_filter_chain_set_rotation(filter_chain, retroarch_get_rotation());
-
-   gl3_filter_chain_set_core_aspect(filter_chain, video_driver_get_core_aspect());
-
-   /* OriginalAspectRotated: return 1/aspect for 90 and 270 rotated content */
-   uint32_t rot = retroarch_get_rotation();
-   float core_aspect_rot = video_driver_get_core_aspect();
-   if (rot == 1 || rot == 3)
-      core_aspect_rot = 1/core_aspect_rot;
-   gl3_filter_chain_set_core_aspect_rot(filter_chain, core_aspect_rot);
-
-   /* Sub-frame info for multiframe shaders (per real content frame).
-      Should always be 1 for non-use of subframes*/
-   if (!(gl->flags & GL3_FLAG_FRAME_DUPE_LOCK))
+   if (gl->flags & GL3_FLAG_SHOULD_RESIZE)
    {
-     if (     video_info->black_frame_insertion
-           || video_info->input_driver_nonblock_state
-           || video_info->runloop_is_slowmotion
-           || video_info->runloop_is_paused
-           || (gl->flags & GL3_FLAG_MENU_TEXTURE_ENABLE))
-        gl3_filter_chain_set_shader_subframes(
-           filter_chain, 1);
-     else
-        gl3_filter_chain_set_shader_subframes(
-           filter_chain, video_info->shader_subframes);
+      if (gl->ctx_driver->set_resize)
+         gl->ctx_driver->set_resize(gl->ctx_data,
+               width, height);
+      gl->flags            &= ~GL3_FLAG_SHOULD_RESIZE;
 
-     gl3_filter_chain_set_current_shader_subframe(
-           filter_chain, 1);
+      if (gl->chain.active && gl->chain.num_fbo_passes != 0)
+      {
+         /* On resize, we might have to recreate our FBOs
+          * due to "Viewport" scale, and set a new viewport. */
+
+         /* Check if we have to recreate our FBO textures. */
+         for (i = 0; i < gl->chain.num_fbo_passes; i++)
+         {
+            struct video_fbo_rect *fbo_rect = &gl->chain.fbo_rect[i];
+            if (fbo_rect)
+            {
+               unsigned img_width   = fbo_rect->max_img_width;
+               unsigned img_height  = fbo_rect->max_img_height;
+
+               if (     (img_width  > fbo_rect->width)
+                     || (img_height > fbo_rect->height))
+               {
+                  /* Check proactively since we might suddenly
+                   * get sizes of tex_w width or tex_h height. */
+                  unsigned max                    = img_width > img_height ? img_width : img_height;
+                  unsigned pow2_size              = next_pow2(max);
+                  bool update_feedback            = gl->chain.fbo_feedback && i == gl->chain.fbo_feedback_pass;
+
+                  fbo_rect->width                 = pow2_size;
+                  fbo_rect->height                = pow2_size;
+
+                  gl3_recreate_fbo(fbo_rect, gl->chain.fbo[i], &gl->chain.fbo_texture[i]);
+
+                  /* Update feedback texture in-place so we avoid having to
+                   * juggle two different fbo_rect structs since they get updated here. */
+                  if (update_feedback)
+                  {
+                     if (gl3_recreate_fbo(fbo_rect, gl->chain.fbo_feedback,
+                              &gl->chain.fbo_feedback_texture))
+                     {
+                        /* Make sure the feedback textures are cleared
+                         * so we don't feedback noise. */
+                        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                        glClear(GL_COLOR_BUFFER_BIT);
+                     }
+                  }
+
+                  RARCH_LOG("[GLCore] Recreating FBO texture #%d: %ux%u.\n",
+                        i, fbo_rect->width, fbo_rect->height);
+               }
+            }
+         }
+
+         /* Go back to what we're supposed to do,
+          * render to FBO #0. */
+         gl3_renderchain_start_render(gl);
+      }
+      else
+         gl3_set_viewport(gl, width, height, false, true);
    }
+
+   if (gl->chain.active)
+   {
+      unsigned i;
+      video_shader_ctx_params_t params;
+      struct video_tex_info feedback_info;
+
+      gl3_update_input_size(gl, frame_width, frame_height);
+
+      /* Have to reset rendering state which libretro core
+       * could easily have overridden. */
+      if (gl->flags & GL3_FLAG_HW_RENDER_ENABLE)
+      {
+         if (gl->chain.num_fbo_passes == 0)
+         {
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            gl3_set_viewport(gl, width, height, false, true);
+         }
+
+         glDisable(GL_DEPTH_TEST);
+         glDisable(GL_CULL_FACE);
+         glDisable(GL_DITHER);
+         glDisable(GL_STENCIL_TEST);
+         glDisable(GL_BLEND);
+         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+         glBlendEquation(GL_FUNC_ADD);
+      }
+
+      gl->chain.tex_info.tex           = texture.image;
+      gl->chain.tex_info.input_size[0] = frame_width;
+      gl->chain.tex_info.input_size[1] = frame_height;
+      gl->chain.tex_info.tex_size[0]   = RARCH_SCALE_BASE * gl->video_info.input_scale;
+      gl->chain.tex_info.tex_size[1]   = RARCH_SCALE_BASE * gl->video_info.input_scale;
+
+      feedback_info                    = gl->chain.tex_info;
+
+      if (gl->chain.fbo_feedback)
+      {
+         const struct video_fbo_rect
+            *rect                      = &gl->chain.fbo_rect[gl->chain.fbo_feedback_pass];
+         GLfloat xamt                  = (GLfloat)rect->img_width / rect->width;
+         GLfloat yamt                  = (GLfloat)rect->img_height / rect->height;
+
+         feedback_info.tex             = gl->chain.fbo_feedback_texture;
+         feedback_info.input_size[0]   = rect->img_width;
+         feedback_info.input_size[1]   = rect->img_height;
+         feedback_info.tex_size[0]     = rect->width;
+         feedback_info.tex_size[1]     = rect->height;
+
+         GL3_SET_TEXTURE_COORDS(feedback_info.coord, xamt, yamt);
+      }
+
+      params.vp_width      = gl->out_vp_width;
+      params.vp_height     = gl->out_vp_height;
+      params.width         = frame_width;
+      params.height        = frame_height;
+      params.tex_width     = RARCH_SCALE_BASE * gl->video_info.input_scale;
+      params.tex_height    = RARCH_SCALE_BASE * gl->video_info.input_scale;
+      params.out_width     = gl->vp.width;
+      params.out_height    = gl->vp.height;
+      params.frame_counter = (unsigned int)frame_count;
+      params.info          = &gl->chain.tex_info;
+      params.prev_info     = gl->chain.prev_info;
+      params.feedback_info = &feedback_info;
+      params.fbo_info      = NULL;
+      params.fbo_info_cnt  = 0;
+
+      glBindTexture(GL_TEXTURE_2D, texture.image);
+      glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+      glClear(GL_COLOR_BUFFER_BIT);
+
+      gl->chain.shader->set_params(&params, gl->chain.shader_data);
+
+      gl->chain.coords.vertices = 4;
+
+      gl->chain.shader->set_coords(gl->chain.shader_data, &gl->chain.coords);
+      gl->chain.shader->set_mvp(gl->chain.shader_data, &gl->mvp);
+
+      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+      if (gl->chain.num_fbo_passes != 0)
+         gl3_renderchain_render(gl, frame_count, &gl->chain.tex_info, &feedback_info);
+
+      memmove(gl->chain.prev_info + 1, gl->chain.prev_info, sizeof(*gl->chain.prev_info) * (gl->chain.num_prev_textures - 1));
+      memcpy(&gl->chain.prev_info[0], &gl->chain.tex_info, sizeof(gl->chain.tex_info));
+
+      /* Implement feedback by swapping out FBO/textures
+       * for FBO pass #N and feedbacks. */
+      if (gl->chain.fbo_feedback)
+      {
+         GLuint tmp_fbo                 = gl->chain.fbo_feedback;
+         GLuint tmp_tex                 = gl->chain.fbo_feedback_texture;
+         gl->chain.fbo_feedback         = gl->chain.fbo[gl->chain.fbo_feedback_pass];
+         gl->chain.fbo_feedback_texture = gl->chain.fbo_texture[gl->chain.fbo_feedback_pass];
+         gl->chain.fbo[gl->chain.fbo_feedback_pass]         = tmp_fbo;
+         gl->chain.fbo_texture[gl->chain.fbo_feedback_pass] = tmp_tex;
+      }
+
+      glBindTexture(GL_TEXTURE_2D, 0);
+   }
+#ifdef HAVE_SLANG
+   else
+   {
+      /* Fast toggle shader filter chain logic */
+      filter_chain = gl->filter_chain;
+
+      if (!video_info->shader_active && gl->filter_chain != gl->filter_chain_default)
+      {
+         if (!gl->filter_chain_default)
+            gl3_init_default_filter_chain(gl);
+
+         if (gl->filter_chain_default)
+            filter_chain = gl->filter_chain_default;
+         else
+            return false;
+      }
+
+      if (!filter_chain && gl->filter_chain_default)
+         filter_chain = gl->filter_chain_default;
+
+      gl3_filter_chain_set_frame_count(filter_chain, frame_count);
+#ifdef HAVE_REWIND
+      gl3_filter_chain_set_frame_direction(filter_chain, state_manager_frame_is_reversed() ? -1 : 1);
+#else
+      gl3_filter_chain_set_frame_direction(filter_chain, 1);
+#endif
+      gl3_filter_chain_set_frame_time_delta(filter_chain, (uint32_t)video_driver_get_frame_time_delta_usec());
+
+      gl3_filter_chain_set_original_fps(filter_chain, video_driver_get_original_fps());
+
+      gl3_filter_chain_set_rotation(filter_chain, retroarch_get_rotation());
+
+      gl3_filter_chain_set_core_aspect(filter_chain, video_driver_get_core_aspect());
+
+      /* OriginalAspectRotated: return 1/aspect for 90 and 270 rotated content */
+      uint32_t rot = retroarch_get_rotation();
+      float core_aspect_rot = video_driver_get_core_aspect();
+      if (rot == 1 || rot == 3)
+         core_aspect_rot = 1/core_aspect_rot;
+      gl3_filter_chain_set_core_aspect_rot(filter_chain, core_aspect_rot);
+
+      /* Sub-frame info for multiframe shaders (per real content frame).
+         Should always be 1 for non-use of subframes*/
+      if (!(gl->flags & GL3_FLAG_FRAME_DUPE_LOCK))
+      {
+        if (     video_info->black_frame_insertion
+              || video_info->input_driver_nonblock_state
+              || video_info->runloop_is_slowmotion
+              || video_info->runloop_is_paused
+              || (gl->flags & GL3_FLAG_MENU_TEXTURE_ENABLE))
+           gl3_filter_chain_set_shader_subframes(
+              filter_chain, 1);
+        else
+           gl3_filter_chain_set_shader_subframes(
+              filter_chain, video_info->shader_subframes);
+
+        gl3_filter_chain_set_current_shader_subframe(
+              filter_chain, 1);
+      }
 
 #ifdef GL3_ROLLING_SCANLINE_SIMULATION
-   if (      (video_info->shader_subframes > 1)
-         &&  (video_info->scan_subframes)
-         &&  !video_info->black_frame_insertion
-         &&  !video_info->input_driver_nonblock_state
-         &&  !video_info->runloop_is_slowmotion
-         &&  !video_info->runloop_is_paused
-         &&  (!(gl->flags & GL3_FLAG_MENU_TEXTURE_ENABLE)))
-      gl3_filter_chain_set_simulate_scanline(
-            filter_chain, true);
-   else
-      gl3_filter_chain_set_simulate_scanline(
-            filter_chain, false);
+      if (      (video_info->shader_subframes > 1)
+            &&  (video_info->scan_subframes)
+            &&  !video_info->black_frame_insertion
+            &&  !video_info->input_driver_nonblock_state
+            &&  !video_info->runloop_is_slowmotion
+            &&  !video_info->runloop_is_paused
+            &&  (!(gl->flags & GL3_FLAG_MENU_TEXTURE_ENABLE)))
+         gl3_filter_chain_set_simulate_scanline(
+               filter_chain, true);
+      else
+         gl3_filter_chain_set_simulate_scanline(
+               filter_chain, false);
 #endif /* GL3_ROLLING_SCANLINE_SIMULATION */
 
-   gl3_filter_chain_set_input_texture(filter_chain, &texture);
-   gl3_filter_chain_build_offscreen_passes(filter_chain,
-         &gl->filter_chain_vp);
+      gl3_filter_chain_set_input_texture(filter_chain, &texture);
+      gl3_filter_chain_build_offscreen_passes(filter_chain,
+            &gl->filter_chain_vp);
 
-   glBindFramebuffer(GL_FRAMEBUFFER, 0);
-   glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-   glClear(GL_COLOR_BUFFER_BIT);
-   gl3_filter_chain_build_viewport_pass(filter_chain,
-         &gl->filter_chain_vp,
-         (gl->flags & GL3_FLAG_HW_RENDER_BOTTOM_LEFT)
-         ? gl->mvp.data
-         : gl->mvp_yflip.data);
-   gl3_filter_chain_end_frame(filter_chain);
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+      glClear(GL_COLOR_BUFFER_BIT);
+      gl3_filter_chain_build_viewport_pass(filter_chain,
+            &gl->filter_chain_vp,
+            (gl->flags & GL3_FLAG_HW_RENDER_BOTTOM_LEFT)
+            ? gl->mvp.data
+            : gl->mvp_yflip.data);
+      gl3_filter_chain_end_frame(filter_chain);
+   }
+#endif /* HAVE_SLANG */
 
 #ifdef HAVE_OVERLAY
    if ((gl->flags & GL3_FLAG_OVERLAY_ENABLE) && overlay_behind_menu)
@@ -3991,12 +4183,17 @@ static bool gl3_frame(void *data, const void *frame,
          &&  (!(gl->flags & GL3_FLAG_FRAME_DUPE_LOCK)))
    {
       gl->flags |= GL3_FLAG_FRAME_DUPE_LOCK;
-      for (i = 1; i < (int) video_info->shader_subframes; i++)
+      for (i = 1; i < video_info->shader_subframes; i++)
       {
-         gl3_filter_chain_set_shader_subframes(
-            filter_chain, video_info->shader_subframes);
-         gl3_filter_chain_set_current_shader_subframe(
-            filter_chain, i+1);
+#ifdef HAVE_SLANG
+         if (!gl->chain.active)
+         {
+            gl3_filter_chain_set_shader_subframes(
+               filter_chain, video_info->shader_subframes);
+            gl3_filter_chain_set_current_shader_subframe(
+               filter_chain, i+1);
+         }
+#endif
 
          if (!gl3_frame(gl, NULL, 0, 0, frame_count, 0, msg,
                   video_info))
