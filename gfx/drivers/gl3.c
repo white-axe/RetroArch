@@ -197,21 +197,21 @@ static const float gl3_vertexes_flipped[8] = {
    1, 0
 };
 
-static const float gl3_vertexes[8]   = {
+static const float gl3_vertexes[8]         = {
    0, 0,
    1, 0,
    0, 1,
    1, 1
 };
 
-static const float gl3_tex_coords[8] = {
+static const float gl3_tex_coords[8]       = {
    0, 1,
    1, 1,
    0, 0,
    1, 0
 };
 
-static const float gl3_colors[16]    = {
+static const float gl3_colors[16]          = {
    1.0f, 1.0f, 1.0f, 1.0f,
    1.0f, 1.0f, 1.0f, 1.0f,
    1.0f, 1.0f, 1.0f, 1.0f,
@@ -460,12 +460,9 @@ static void gfx_display_gl3_draw_pipeline(
       unsigned video_height)
 {
 #ifdef HAVE_SHADERPIPELINE
-   float output_size[2];
-   static struct video_coords blank_coords;
-   static uint8_t ubo_scratch_data[768];
    static float t                = 0.0f;
    float yflip                   = 0.0f;
-   video_coord_array_t *ca       = NULL;
+   video_coord_array_t *ca       = &p_disp->dispca;
    gl3_t *gl                 = (gl3_t*)data;
 
    if (!gl || !draw)
@@ -475,54 +472,125 @@ static void gfx_display_gl3_draw_pipeline(
    draw->y                       = 0;
    draw->matrix_data             = NULL;
 
-   output_size[0]                = (float)video_width;
-   output_size[1]                = (float)video_height;
-
-   switch (draw->pipeline_id)
+   if (gl->chain.active)
    {
-      /* Ribbon */
-      default:
-      case VIDEO_SHADER_MENU:
-      case VIDEO_SHADER_MENU_2:
-         ca                               = &p_disp->dispca;
-         draw->coords                     = (struct video_coords*)&ca->coords;
-         draw->backend_data               = ubo_scratch_data;
-         draw->backend_data_size          = 2 * sizeof(float);
+      struct uniform_info uniform_param;
 
-         /* Match UBO layout in shader. */
-         yflip = -1.0f;
-         memcpy(ubo_scratch_data, &t, sizeof(t));
-         memcpy(ubo_scratch_data + sizeof(float), &yflip, sizeof(yflip));
-         break;
+      draw->coords = (struct video_coords*)(&ca->coords);
 
-      /* Snow simple */
-      case VIDEO_SHADER_MENU_3:
-      case VIDEO_SHADER_MENU_4:
-      case VIDEO_SHADER_MENU_5:
-         draw->backend_data               = ubo_scratch_data;
-         draw->backend_data_size          = sizeof(math_matrix_4x4)
-            + 4 * sizeof(float);
+      switch (draw->pipeline_id)
+      {
+         case VIDEO_SHADER_MENU:
+         case VIDEO_SHADER_MENU_2:
+            glBlendFunc(GL_DST_COLOR, GL_ONE);
+            break;
+         default:
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            break;
+      }
 
-         /* Match UBO layout in shader. */
-         memcpy(ubo_scratch_data,
-               &gl->mvp_no_rot,
-               sizeof(math_matrix_4x4));
-         memcpy(ubo_scratch_data + sizeof(math_matrix_4x4),
-               output_size,
-               sizeof(output_size));
+      switch (draw->pipeline_id)
+      {
+         case VIDEO_SHADER_MENU:
+         case VIDEO_SHADER_MENU_2:
+         case VIDEO_SHADER_MENU_3:
+         case VIDEO_SHADER_MENU_4:
+         case VIDEO_SHADER_MENU_5:
+         case VIDEO_SHADER_MENU_6:
+            gl->chain.shader->use(gl, gl->chain.shader_data, draw->pipeline_id,
+                  true);
 
-         if (draw->pipeline_id == VIDEO_SHADER_MENU_5)
-            yflip = 1.0f;
+            t += 0.01;
 
-         memcpy(ubo_scratch_data + sizeof(math_matrix_4x4)
-               + 2 * sizeof(float), &t, sizeof(t));
-         memcpy(ubo_scratch_data + sizeof(math_matrix_4x4)
-               + 3 * sizeof(float), &yflip, sizeof(yflip));
-         draw->coords          = &blank_coords;
-         blank_coords.vertices = 4;
-         draw->prim_type       = GFX_DISPLAY_PRIM_TRIANGLESTRIP;
-         break;
+            uniform_param.type              = UNIFORM_1F;
+            uniform_param.enabled           = true;
+            uniform_param.location          = 0;
+            uniform_param.count             = 0;
+
+            uniform_param.lookup.type       = SHADER_PROGRAM_VERTEX;
+            uniform_param.lookup.ident      = "time";
+            uniform_param.lookup.idx        = draw->pipeline_id;
+            uniform_param.lookup.add_prefix = true;
+            uniform_param.lookup.enable     = true;
+
+            uniform_param.result.f.v0       = t;
+
+            gl->chain.shader->set_uniform_parameter(gl->chain.shader_data,
+                  &uniform_param, NULL);
+            break;
+      }
+
+      switch (draw->pipeline_id)
+      {
+         case VIDEO_SHADER_MENU_3:
+         case VIDEO_SHADER_MENU_4:
+         case VIDEO_SHADER_MENU_5:
+         case VIDEO_SHADER_MENU_6:
+            uniform_param.type              = UNIFORM_2F;
+            uniform_param.lookup.ident      = "OutputSize";
+            uniform_param.result.f.v0       = draw->width;
+            uniform_param.result.f.v1       = draw->height;
+
+            gl->chain.shader->set_uniform_parameter(gl->chain.shader_data,
+                  &uniform_param, NULL);
+            break;
+      }
    }
+#ifdef HAVE_SLANG
+   else
+   {
+      static struct video_coords blank_coords;
+      static uint8_t ubo_scratch_data[768];
+      float output_size[2];
+      output_size[0]                = (float)video_width;
+      output_size[1]                = (float)video_height;
+
+      switch (draw->pipeline_id)
+      {
+         /* Ribbon */
+         default:
+         case VIDEO_SHADER_MENU:
+         case VIDEO_SHADER_MENU_2:
+            draw->coords                     = (struct video_coords*)&ca->coords;
+            draw->backend_data               = ubo_scratch_data;
+            draw->backend_data_size          = 2 * sizeof(float);
+
+            /* Match UBO layout in shader. */
+            yflip = -1.0f;
+            memcpy(ubo_scratch_data, &t, sizeof(t));
+            memcpy(ubo_scratch_data + sizeof(float), &yflip, sizeof(yflip));
+            break;
+
+         /* Snow simple */
+         case VIDEO_SHADER_MENU_3:
+         case VIDEO_SHADER_MENU_4:
+         case VIDEO_SHADER_MENU_5:
+            draw->backend_data               = ubo_scratch_data;
+            draw->backend_data_size          = sizeof(math_matrix_4x4)
+               + 4 * sizeof(float);
+
+            /* Match UBO layout in shader. */
+            memcpy(ubo_scratch_data,
+                  &gl->mvp_no_rot,
+                  sizeof(math_matrix_4x4));
+            memcpy(ubo_scratch_data + sizeof(math_matrix_4x4),
+                  output_size,
+                  sizeof(output_size));
+
+            if (draw->pipeline_id == VIDEO_SHADER_MENU_5)
+               yflip = 1.0f;
+
+            memcpy(ubo_scratch_data + sizeof(math_matrix_4x4)
+                  + 2 * sizeof(float), &t, sizeof(t));
+            memcpy(ubo_scratch_data + sizeof(math_matrix_4x4)
+                  + 3 * sizeof(float), &yflip, sizeof(yflip));
+            draw->coords          = &blank_coords;
+            blank_coords.vertices = 4;
+            draw->prim_type       = GFX_DISPLAY_PRIM_TRIANGLESTRIP;
+            break;
+      }
+   }
+#endif
 
    t += 0.01;
 #endif
