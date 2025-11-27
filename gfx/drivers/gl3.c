@@ -3450,25 +3450,42 @@ static void gl3_draw_menu_texture(gl3_t *gl,
    glActiveTexture(GL_TEXTURE0 + 1);
    glBindTexture(GL_TEXTURE_2D, gl->menu_texture);
 
-   glUseProgram(gl->pipelines.alpha_blend);
-   if (gl->pipelines.alpha_blend_loc.flat_ubo_vertex >= 0)
-      glUniform4fv(gl->pipelines.alpha_blend_loc.flat_ubo_vertex, 4, gl->mvp_no_rot_yflip.data);
+   if (gl->chain.active)
+   {
+      gl->chain.shader->use(gl,
+            gl->chain.shader_data, VIDEO_SHADER_STOCK_BLEND, true);
 
-   glEnableVertexAttribArray(0);
-   glEnableVertexAttribArray(1);
-   glEnableVertexAttribArray(2);
-   gl3_bind_scratch_vbo(gl, vbo_data, sizeof(vbo_data));
-   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
-         8 * sizeof(float), (void *)(uintptr_t)0);
-   glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE,
-         8 * sizeof(float), (void *)(uintptr_t)(2 * sizeof(float)));
-   glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE,
-         8 * sizeof(float), (void *)(uintptr_t)(4 * sizeof(float)));
-   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-   glDisableVertexAttribArray(0);
-   glDisableVertexAttribArray(1);
-   glDisableVertexAttribArray(2);
-   glBindBuffer(GL_ARRAY_BUFFER, 0);
+      gl->chain.coords.vertices    = 4;
+
+      gl->chain.shader->set_coords(gl->chain.shader_data, &gl->chain.coords);
+      gl->chain.shader->set_mvp(gl->chain.shader_data, &gl->mvp_no_rot);
+
+      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+   }
+#ifdef HAVE_SLANG
+   else
+   {
+      glUseProgram(gl->pipelines.alpha_blend);
+      if (gl->pipelines.alpha_blend_loc.flat_ubo_vertex >= 0)
+         glUniform4fv(gl->pipelines.alpha_blend_loc.flat_ubo_vertex, 4, gl->mvp_no_rot_yflip.data);
+
+      glEnableVertexAttribArray(0);
+      glEnableVertexAttribArray(1);
+      glEnableVertexAttribArray(2);
+      gl3_bind_scratch_vbo(gl, vbo_data, sizeof(vbo_data));
+      glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
+            8 * sizeof(float), (void *)(uintptr_t)0);
+      glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE,
+            8 * sizeof(float), (void *)(uintptr_t)(2 * sizeof(float)));
+      glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE,
+            8 * sizeof(float), (void *)(uintptr_t)(4 * sizeof(float)));
+      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+      glDisableVertexAttribArray(0);
+      glDisableVertexAttribArray(1);
+      glDisableVertexAttribArray(2);
+      glBindBuffer(GL_ARRAY_BUFFER, 0);
+   }
+#endif
 
    glDisable(GL_BLEND);
 }
@@ -4042,8 +4059,10 @@ static void gl3_apply_state_changes(void *data)
 static struct video_shader *gl3_get_current_shader(void *data)
 {
    gl3_t *gl = (gl3_t*)data;
+#ifdef HAVE_SLANG
    if (gl && gl->filter_chain)
       return gl3_filter_chain_get_preset(gl->filter_chain);
+#endif
    return NULL;
 }
 
