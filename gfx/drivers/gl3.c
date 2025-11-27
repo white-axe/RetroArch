@@ -52,12 +52,22 @@
 #include "../font_driver.h"
 #include "../../record/record_driver.h"
 
+#ifdef HAVE_GLSL
+#include "../drivers_shader/shader_glsl.h"
+#endif
+
 #ifdef HAVE_MENU
 #include "../../menu/menu_driver.h"
 #endif
 #ifdef HAVE_GFX_WIDGETS
 #include "../gfx_widgets.h"
 #endif
+
+#define GL3_SET_TEXTURE_COORDS(coords, xamt, yamt) \
+   coords[2] = xamt; \
+   coords[6] = xamt; \
+   coords[5] = yamt; \
+   coords[7] = yamt
 
 struct gl3_streamed_texture
 {
@@ -89,24 +99,55 @@ typedef struct gl3
    GLuint menu_texture;
    GLuint pbo_readback[GL_CORE_NUM_PBOS];
 
+   /* Render chain for non-Slang shaders only. */
+   struct
+   {
+      const shader_backend_t *shader;
+      void *shader_data;
+      unsigned num_fbo_passes;
+      unsigned num_prev_textures;
+      GLuint fbo_feedback;
+      unsigned fbo_feedback_pass;
+      GLuint fbo_feedback_texture;
+      unsigned last_width[GL_CORE_NUM_TEXTURES];
+      unsigned last_height[GL_CORE_NUM_TEXTURES];
+      unsigned hw_render_last_width;
+      unsigned hw_render_last_height;
+      GLuint fbo[GFX_MAX_SHADERS];
+      GLuint fbo_texture[GFX_MAX_SHADERS];
+      struct video_fbo_rect fbo_rect[GFX_MAX_SHADERS];
+      struct gfx_fbo_scale fbo_scale[GFX_MAX_SHADERS];
+      struct video_tex_info tex_info;
+      struct video_tex_info prev_info[GFX_MAX_TEXTURES];
+      struct video_coords coords;
+      const float *vertex_ptr;
+      bool active;
+      bool mipmap_active;
+   } chain;
+
+#ifdef HAVE_SLANG
    struct
    {
       GLuint alpha_blend;
+#ifdef HAVE_SHADERPIPELINE
       GLuint font;
       GLuint ribbon;
       GLuint ribbon_simple;
       GLuint snow_simple;
       GLuint snow;
       GLuint bokeh;
+#endif /* HAVE_SHADERPIPELINE */
       struct gl3_buffer_locations alpha_blend_loc;
+#ifdef HAVE_SHADERPIPELINE
       struct gl3_buffer_locations font_loc;
       struct gl3_buffer_locations ribbon_loc;
       struct gl3_buffer_locations ribbon_simple_loc;
       struct gl3_buffer_locations snow_simple_loc;
       struct gl3_buffer_locations snow_loc;
       struct gl3_buffer_locations bokeh_loc;
+#endif /* HAVE_SHADERPIPELINE */
    } pipelines;
-
+#endif /* HAVE_SLANG */
 
    unsigned video_width;
    unsigned video_height;
@@ -138,7 +179,23 @@ typedef struct gl3
    bool pbo_readback_valid[GL_CORE_NUM_PBOS];
 } gl3_t;
 
+typedef struct gl3_video_shader_ctx_init
+{
+   const char *path;
+   const shader_backend_t *shader;
+   void *data;
+   void *shader_data;
+   enum rarch_shader_type shader_type;
+} gl3_video_shader_ctx_init_t;
+
 static const struct video_ortho gl3_default_ortho = {0, 1, 0, 1, -1, 1};
+
+static const float gl3_vertexes_flipped[8] = {
+   0, 1,
+   1, 1,
+   0, 0,
+   1, 0
+};
 
 static const float gl3_vertexes[8]   = {
    0, 0,
@@ -469,6 +526,23 @@ static void gfx_display_gl3_draw_pipeline(
 
    t += 0.01;
 #endif
+}
+
+static GLenum gfx_display_prim_to_gl3_enum(
+      enum gfx_display_prim_type type)
+{
+   switch (type)
+   {
+      case GFX_DISPLAY_PRIM_TRIANGLESTRIP:
+         return GL_TRIANGLE_STRIP;
+      case GFX_DISPLAY_PRIM_TRIANGLES:
+         return GL_TRIANGLES;
+      case GFX_DISPLAY_PRIM_NONE:
+      default:
+         break;
+   }
+
+   return 0;
 }
 
 static void gfx_display_gl3_draw(gfx_display_ctx_draw_t *draw,
@@ -1336,10 +1410,12 @@ static void gl3_render_overlay(gl3_t *gl,
    if (gl->flags & GL3_FLAG_OVERLAY_FULLSCREEN)
       glViewport(0, 0, width, height);
 
+#ifdef HAVE_SLANG
    /* Ensure that we reset the attrib array. */
    glUseProgram(gl->pipelines.alpha_blend);
    if (gl->pipelines.alpha_blend_loc.flat_ubo_vertex >= 0)
       glUniform4fv(gl->pipelines.alpha_blend_loc.flat_ubo_vertex, 4, gl->mvp_no_rot.data);
+#endif
 
    glEnableVertexAttribArray(0);
    glEnableVertexAttribArray(1);
@@ -1407,12 +1483,16 @@ static void gl3_destroy_resources(gl3_t *gl)
    if (gl->flags & GL3_FLAG_USE_SHARED_CONTEXT)
       gl->ctx_driver->bind_hw_render(gl->ctx_data, false);
 
+#ifdef HAVE_SLANG
    if (gl->filter_chain)
       gl3_filter_chain_free(gl->filter_chain);
+#endif
    gl->filter_chain = NULL;
 
+#ifdef HAVE_SLANG
    if (gl->filter_chain_default)
       gl3_filter_chain_free(gl->filter_chain_default);
+#endif
    gl->filter_chain_default = NULL;
 
    glBindVertexArray(0);
@@ -1429,20 +1509,45 @@ static void gl3_destroy_resources(gl3_t *gl)
    if (gl->menu_texture != 0)
       glDeleteTextures(1, &gl->menu_texture);
 
+#ifdef HAVE_SLANG
    if (gl->pipelines.alpha_blend)
+   {
       glDeleteProgram(gl->pipelines.alpha_blend);
+      gl->pipelines.alpha_blend = 0;
+   }
+#ifdef HAVE_SHADERPIPELINE
    if (gl->pipelines.font)
+   {
       glDeleteProgram(gl->pipelines.font);
+      gl->pipelines.font = 0;
+   }
    if (gl->pipelines.ribbon)
+   {
       glDeleteProgram(gl->pipelines.ribbon);
+      gl->pipelines.ribbon = 0;
+   }
    if (gl->pipelines.ribbon_simple)
+   {
       glDeleteProgram(gl->pipelines.ribbon_simple);
+      gl->pipelines.ribbon_simple = 0;
+   }
    if (gl->pipelines.snow_simple)
+   {
       glDeleteProgram(gl->pipelines.snow_simple);
+      gl->pipelines.snow_simple = 0;
+   }
    if (gl->pipelines.snow)
+   {
       glDeleteProgram(gl->pipelines.snow);
+      gl->pipelines.snow = 0;
+   }
    if (gl->pipelines.bokeh)
+   {
       glDeleteProgram(gl->pipelines.bokeh);
+      gl->pipelines.bokeh = 0;
+   }
+#endif /* HAVE_SHADERPIPELINE */
+#endif /* HAVE_SLANG */
 
 #ifdef HAVE_OVERLAY
    gl3_free_overlay(gl);
@@ -1602,6 +1707,34 @@ static const gfx_ctx_driver_t *gl3_get_context(gl3_t *gl)
    return gfx_ctx;
 }
 
+static bool gl3_recreate_fbo(
+      struct video_fbo_rect *fbo_rect,
+      GLuint fbo,
+      GLuint* texture)
+{
+   glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+   glDeleteTextures(1, texture);
+   glGenTextures(1, texture);
+   glBindTexture(GL_TEXTURE_2D, *texture);
+   glTexImage2D(GL_TEXTURE_2D,
+         0, GL_RGBA8,
+         fbo_rect->width,
+         fbo_rect->height,
+         0, GL_RGBA,
+         GL_UNSIGNED_BYTE, NULL);
+
+   glFramebufferTexture2D(GL_FRAMEBUFFER,
+         GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+         *texture, 0);
+
+   if (glCheckFramebufferStatus(GL_FRAMEBUFFER)
+         == GL_FRAMEBUFFER_COMPLETE)
+      return true;
+
+   RARCH_WARN("[GLCore] Failed to reinitialize FBO texture.\n");
+   return false;
+}
+
 static void gl3_set_projection(gl3_t *gl,
       const struct video_ortho *ortho, bool allow_rotate)
 {
@@ -1697,6 +1830,7 @@ static void gl3_set_viewport(gl3_t *gl,
    gl->filter_chain_vp.height = gl->vp.height;
 }
 
+#ifdef HAVE_SLANG
 static bool gl3_init_pipelines(gl3_t *gl)
 {
    static const uint32_t alpha_blend_vert[] =
@@ -1707,6 +1841,7 @@ static bool gl3_init_pipelines(gl3_t *gl)
 #include "vulkan_shaders/alpha_blend.frag.inc"
       ;
 
+#ifdef HAVE_SHADERPIPELINE
    static const uint32_t font_frag[] =
 #include "vulkan_shaders/font.frag.inc"
       ;
@@ -1738,6 +1873,7 @@ static bool gl3_init_pipelines(gl3_t *gl)
    static const uint32_t pipeline_bokeh_frag[] =
 #include "vulkan_shaders/pipeline_bokeh.frag.inc"
       ;
+#endif /* HAVE_SHADERPIPELINE */
 
    gl->pipelines.alpha_blend = gl3_cross_compile_program(alpha_blend_vert, sizeof(alpha_blend_vert),
                                                              alpha_blend_frag, sizeof(alpha_blend_frag),
@@ -1745,6 +1881,7 @@ static bool gl3_init_pipelines(gl3_t *gl)
    if (!gl->pipelines.alpha_blend)
       return false;
 
+#ifdef HAVE_SHADERPIPELINE
    gl->pipelines.font = gl3_cross_compile_program(alpha_blend_vert, sizeof(alpha_blend_vert),
                                                       font_frag, sizeof(font_frag),
                                                       &gl->pipelines.font_loc, true);
@@ -1780,10 +1917,78 @@ static bool gl3_init_pipelines(gl3_t *gl)
                                                       &gl->pipelines.snow_loc, true);
    if (!gl->pipelines.snow)
       return false;
+#endif /* HAVE_SHADERPIPELINE */
 
    return true;
 }
+#endif /* HAVE_SLANG */
 
+/**
+ * gl3_get_fallback_shader_type:
+ * @type                      : shader type which should be used if possible
+ *
+ * Returns a supported fallback shader type in case the given one is not supported.
+ * For gl3, shader support is completely defined by the context driver shader flags.
+ *
+ * gl3_get_fallback_shader_type(RARCH_SHADER_NONE) returns a default shader type.
+ * if gl3_get_fallback_shader_type(type) != type, type was not supported.
+ *
+ * Returns: A supported shader type.
+ *  If RARCH_SHADER_NONE is returned, no shader backend is supported.
+ **/
+static enum rarch_shader_type gl3_get_fallback_shader_type(enum rarch_shader_type type)
+{
+#if defined(HAVE_SLANG) || defined(HAVE_GLSL) || defined(HAVE_CG)
+   int i;
+   gfx_ctx_flags_t flags;
+   flags.flags     = 0;
+   video_context_driver_get_flags(&flags);
+
+   if (type != RARCH_SHADER_CG && type != RARCH_SHADER_GLSL && type != RARCH_SHADER_SLANG)
+   {
+      type = DEFAULT_SHADER_TYPE;
+
+      if (type != RARCH_SHADER_CG && type != RARCH_SHADER_GLSL && type != RARCH_SHADER_SLANG)
+         type = RARCH_SHADER_SLANG;
+   }
+
+   for (i = 0; i < 3; i++)
+   {
+      switch (type)
+      {
+         case RARCH_SHADER_CG:
+#ifdef HAVE_CG
+            if (BIT32_GET(flags.flags, GFX_CTX_FLAGS_SHADERS_CG))
+               return type;
+#endif
+            type = RARCH_SHADER_SLANG;
+            break;
+
+         case RARCH_SHADER_GLSL:
+#ifdef HAVE_GLSL
+            if (BIT32_GET(flags.flags, GFX_CTX_FLAGS_SHADERS_GLSL))
+               return type;
+#endif
+            type = RARCH_SHADER_CG;
+            break;
+
+         case RARCH_SHADER_SLANG:
+#ifdef HAVE_SLANG
+            if (BIT32_GET(flags.flags, GFX_CTX_FLAGS_SHADERS_SLANG))
+               return type;
+#endif
+            type = RARCH_SHADER_GLSL;
+            break;
+
+         default:
+            return RARCH_SHADER_NONE;
+      }
+   }
+#endif
+   return RARCH_SHADER_NONE;
+}
+
+#ifdef HAVE_SLANG
 static bool gl3_init_default_filter_chain(gl3_t *gl)
 {
    if (!gl->ctx_driver)
@@ -1825,10 +2030,345 @@ static bool gl3_init_filter_chain_preset(gl3_t *gl, const char *shader_path)
 
    return true;
 }
+#endif /* HAVE_SLANG */
 
-static bool gl3_init_filter_chain(gl3_t *gl)
+static const shader_backend_t *gl3_shader_driver_set_backend(
+      enum rarch_shader_type type)
 {
-   const char *shader_path     = video_shader_get_current_shader_preset();
+   enum rarch_shader_type fallback = gl3_get_fallback_shader_type(type);
+   if (fallback != type)
+      RARCH_ERR("[GLCore] Shader backend %d not supported, falling back to %d.\n", type, fallback);
+
+   switch (fallback)
+   {
+#ifdef HAVE_CG
+      case RARCH_SHADER_CG:
+         RARCH_LOG("[GLCore] Using Cg shader backend.\n");
+         return &gl_cg_backend;
+#endif
+#ifdef HAVE_GLSL
+      case RARCH_SHADER_GLSL:
+         RARCH_LOG("[GLCore] Using GLSL shader backend.\n");
+         return &gl_glsl_backend;
+#endif
+      default:
+         RARCH_LOG("[GLCore] No supported shader backend.\n");
+         return NULL;
+   }
+}
+
+static bool gl3_shader_driver_init(gl3_video_shader_ctx_init_t *init)
+{
+   void            *tmp = NULL;
+   settings_t *settings = config_get_ptr();
+
+   if (!init->shader || !init->shader->init)
+   {
+      init->shader = gl3_shader_driver_set_backend(init->shader_type);
+
+      if (!init->shader)
+         return false;
+   }
+
+   tmp = init->shader->init(init->data, init->path);
+
+   if (!tmp)
+      return false;
+
+   if (string_is_equal(settings->arrays.menu_driver, "xmb")
+         && init->shader->init_menu_shaders)
+   {
+      RARCH_LOG("[GLCore] Setting up menu pipeline shaders for XMB...\n");
+      init->shader->init_menu_shaders(tmp);
+   }
+
+   init->shader_data = tmp;
+
+   return true;
+}
+
+static void gl3_renderchain_recompute_pass_sizes(
+      gl3_t *gl,
+      unsigned width, unsigned height,
+      unsigned vp_width, unsigned vp_height)
+{
+   size_t i;
+   bool size_modified       = false;
+   GLint max_size           = 0;
+   unsigned last_width      = width;
+   unsigned last_height     = height;
+   unsigned last_max_width  = RARCH_SCALE_BASE * gl->video_info.input_scale;
+   unsigned last_max_height = RARCH_SCALE_BASE * gl->video_info.input_scale;
+
+   glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_size);
+
+   /* Calculate viewports for FBOs. */
+   for (i = 0; i < gl->chain.num_fbo_passes; i++)
+   {
+      struct video_fbo_rect *fbo_rect    = &gl->chain.fbo_rect[i];
+      struct gfx_fbo_scale *fbo_scale    = &gl->chain.fbo_scale[i];
+
+      switch (fbo_scale->type_x)
+      {
+         case RARCH_SCALE_INPUT:
+            fbo_rect->img_width      = fbo_scale->scale_x * last_width;
+            fbo_rect->max_img_width  = last_max_width     * fbo_scale->scale_x;
+            break;
+
+         case RARCH_SCALE_ABSOLUTE:
+            fbo_rect->img_width      = fbo_rect->max_img_width =
+               fbo_scale->abs_x;
+            break;
+
+         case RARCH_SCALE_VIEWPORT:
+            if (gl->rotation % 180 == 90)
+               fbo_rect->img_width = fbo_rect->max_img_width =
+               fbo_scale->scale_x * vp_height;
+            else
+               fbo_rect->img_width = fbo_rect->max_img_width =
+               fbo_scale->scale_x * vp_width;
+            break;
+      }
+
+      switch (fbo_scale->type_y)
+      {
+         case RARCH_SCALE_INPUT:
+            fbo_rect->img_height     = last_height * fbo_scale->scale_y;
+            fbo_rect->max_img_height = last_max_height * fbo_scale->scale_y;
+            break;
+
+         case RARCH_SCALE_ABSOLUTE:
+            fbo_rect->img_height     = fbo_scale->abs_y;
+            fbo_rect->max_img_height = fbo_scale->abs_y;
+            break;
+
+         case RARCH_SCALE_VIEWPORT:
+            if (gl->rotation % 180 == 90)
+               fbo_rect->img_height = fbo_rect->max_img_height =
+               fbo_scale->scale_y * vp_width;
+            else
+               fbo_rect->img_height = fbo_rect->max_img_height =
+                  fbo_scale->scale_y * vp_height;
+            break;
+      }
+
+      if (fbo_rect->img_width > (unsigned)max_size)
+      {
+         size_modified            = true;
+         fbo_rect->img_width      = max_size;
+      }
+
+      if (fbo_rect->img_height > (unsigned)max_size)
+      {
+         size_modified            = true;
+         fbo_rect->img_height     = max_size;
+      }
+
+      if (fbo_rect->max_img_width > (unsigned)max_size)
+      {
+         size_modified            = true;
+         fbo_rect->max_img_width  = max_size;
+      }
+
+      if (fbo_rect->max_img_height > (unsigned)max_size)
+      {
+         size_modified            = true;
+         fbo_rect->max_img_height = max_size;
+      }
+
+      if (size_modified)
+         RARCH_WARN("[GLCore] FBO textures exceeded maximum size of GPU (%dx%d). Resizing to fit.\n", max_size, max_size);
+
+      last_width      = fbo_rect->img_width;
+      last_height     = fbo_rect->img_height;
+      last_max_width  = fbo_rect->max_img_width;
+      last_max_height = fbo_rect->max_img_height;
+   }
+}
+
+static void gl3_create_fbo_texture(gl3_t *gl,
+      unsigned pass, GLuint texture)
+{
+   GLint mag_filter;
+   GLint min_filter;
+   bool smooth;
+
+   if (!gl->chain.shader->filter_type(gl->chain.shader_data, pass + 2, &smooth))
+      smooth = gl->video_info.smooth;
+
+   mag_filter = smooth ? GL_LINEAR : GL_NEAREST;
+   min_filter = gl->chain.shader->mipmap_input(gl->chain.shader_data, pass + 2)
+      ? (smooth ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_NEAREST)
+      : mag_filter;
+
+   glBindTexture(GL_TEXTURE_2D, texture);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag_filter);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_filter);
+   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, gl->chain.fbo_rect[pass].width, gl->chain.fbo_rect[pass].height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+   glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+static bool gl3_create_fbo_targets(gl3_t *gl)
+{
+   unsigned i;
+   struct gfx_fbo_scale scale, scale_last;
+
+   gl->chain.active               = true;
+   gl->chain.mipmap_active        = gl->chain.shader->mipmap_input(gl->chain.shader_data, 1);
+   gl->chain.fbo_feedback         = 0;
+   gl->chain.fbo_feedback_pass    = 0;
+   gl->chain.fbo_feedback_texture = 0;
+   gl->chain.num_fbo_passes       = gl->chain.shader->num_shaders(gl->chain.shader_data);
+   gl->chain.num_prev_textures    = gl->chain.shader->get_prev_textures(gl->chain.shader_data);
+   if (gl->chain.num_prev_textures < 1)
+      gl->chain.num_prev_textures = 1;
+
+   memcpy(gl->chain.tex_info.coord, gl3_vertexes, sizeof(gl->chain.tex_info.coord));
+   gl->chain.coords.vertex        = gl->chain.vertex_ptr;
+   gl->chain.coords.tex_coord     = gl->chain.tex_info.coord;
+   gl->chain.coords.color         = gl3_colors;
+   gl->chain.coords.lut_tex_coord = gl3_vertexes;
+   gl->chain.coords.vertices      = 4;
+
+   for (i = 0; i < gl->chain.num_prev_textures; i++)
+   {
+      gl->chain.prev_info[i].tex           = gl->textures[0].tex;
+      gl->chain.prev_info[i].input_size[0] = RARCH_SCALE_BASE * gl->video_info.input_scale;
+      gl->chain.prev_info[i].input_size[1] = RARCH_SCALE_BASE * gl->video_info.input_scale;
+      gl->chain.prev_info[i].tex_size[0]   = RARCH_SCALE_BASE * gl->video_info.input_scale;
+      gl->chain.prev_info[i].tex_size[1]   = RARCH_SCALE_BASE * gl->video_info.input_scale;
+      memcpy(gl->chain.prev_info[i].coord, gl3_vertexes, sizeof(gl->chain.prev_info[i].coord));
+   }
+
+   if (gl->flags & GL3_FLAG_HW_RENDER_ENABLE)
+   {
+      bool force_smooth;
+      bool smooth = gl->chain.shader->filter_type(gl->chain.shader_data, 1, &force_smooth)
+         ? force_smooth
+         : gl->video_info.smooth;
+
+      GLint mag_filter = smooth ? GL_LINEAR : GL_NEAREST;
+      GLint min_filter = gl->chain.mipmap_active
+         ? (smooth ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_NEAREST)
+         : mag_filter;
+
+      glBindTexture(GL_TEXTURE_2D, gl->hw_render_texture);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag_filter);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_filter);
+   }
+
+   if (gl->chain.num_fbo_passes == 0)
+      return true;
+
+   scale_last.flags = 0;
+   gl->chain.shader->shader_scale(gl->chain.shader_data, gl->chain.num_fbo_passes, &scale_last);
+
+   if (!(scale_last.flags & FBO_SCALE_FLAG_VALID) && --gl->chain.num_fbo_passes == 0)
+      return true;
+
+   scale.flags = 0;
+   gl->chain.shader->shader_scale(gl->chain.shader_data, 1, &scale);
+
+   if (!(scale.flags & FBO_SCALE_FLAG_VALID))
+   {
+      scale.scale_x    = 1.0f;
+      scale.scale_y    = 1.0f;
+      scale.type_x     = RARCH_SCALE_INPUT;
+      scale.type_y     = RARCH_SCALE_INPUT;
+      scale.flags     |= FBO_SCALE_FLAG_VALID;
+   }
+
+   gl->chain.fbo_scale[0] = scale;
+
+   for (i = 1; i < gl->chain.num_fbo_passes; i++)
+   {
+      gl->chain.shader->shader_scale(gl->chain.shader_data, i + 1, &gl->chain.fbo_scale[i]);
+
+      if (!(gl->chain.fbo_scale[i].flags & FBO_SCALE_FLAG_VALID))
+      {
+         gl->chain.fbo_scale[i].scale_x = gl->chain.fbo_scale[i].scale_y = 1.0f;
+         gl->chain.fbo_scale[i].type_x  = gl->chain.fbo_scale[i].type_y  =
+            RARCH_SCALE_INPUT;
+         gl->chain.fbo_scale[i].flags  |= FBO_SCALE_FLAG_VALID;
+      }
+   }
+
+   gl3_renderchain_recompute_pass_sizes(
+         gl,
+         RARCH_SCALE_BASE * gl->video_info.input_scale,
+         RARCH_SCALE_BASE * gl->video_info.input_scale,
+         gl->video_width,
+         gl->video_height);
+
+   glGenFramebuffers(gl->chain.num_fbo_passes, gl->chain.fbo);
+   glGenTextures(gl->chain.num_fbo_passes, gl->chain.fbo_texture);
+
+   for (i = 0; i < gl->chain.num_fbo_passes; i++)
+   {
+      gl->chain.fbo_rect[i].width  = next_pow2(gl->chain.fbo_rect[i].img_width);
+      gl->chain.fbo_rect[i].height = next_pow2(gl->chain.fbo_rect[i].img_height);
+      RARCH_LOG("[GLCore] Creating FBO %d @ %ux%u.\n", i,
+            gl->chain.fbo_rect[i].width, gl->chain.fbo_rect[i].height);
+
+      if (gl->chain.fbo[i] == 0 || gl->chain.fbo_texture[i] == 0)
+         goto error;
+
+      gl3_create_fbo_texture(gl, i, gl->chain.fbo_texture[i]);
+
+      glBindFramebuffer(GL_FRAMEBUFFER, gl->chain.fbo[i]);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gl->chain.fbo_texture[i], 0);
+      if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+         goto error;
+   }
+
+   if (gl->chain.shader->get_feedback_pass(gl->chain.shader_data, &gl->chain.fbo_feedback_pass))
+   {
+      if (gl->chain.fbo_feedback_pass < gl->chain.num_fbo_passes)
+      {
+         RARCH_LOG("[GLCore] Creating feedback FBO %d @ %ux%u.\n", i,
+               gl->chain.fbo_rect[gl->chain.fbo_feedback_pass].width,
+               gl->chain.fbo_rect[gl->chain.fbo_feedback_pass].height);
+
+         glGenFramebuffers(1, &gl->chain.fbo_feedback);
+         if (!gl->chain.fbo_feedback)
+            goto error;
+
+         glGenTextures(1, &gl->chain.fbo_feedback_texture);
+         if (!gl->chain.fbo_feedback_texture)
+            goto error;
+
+         gl3_create_fbo_texture(gl, gl->chain.fbo_feedback_pass, gl->chain.fbo_feedback_texture);
+
+         glBindFramebuffer(GL_FRAMEBUFFER, gl->chain.fbo_feedback);
+         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gl->chain.fbo_feedback_texture, 0);
+         if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+            goto error;
+      }
+      else
+         RARCH_WARN("[GLCore] Tried to create feedback FBO of pass #%u, but there are only %d FBO passes. Will use input texture as feedback texture.\n",
+               gl->chain.fbo_feedback_pass, gl->chain.num_fbo_passes);
+   }
+
+   return true;
+
+error:
+   RARCH_ERR("[GLCore] Failed to set up frame buffer objects. Multi-pass shading will not work.\n");
+   if (gl->chain.fbo_feedback_texture)
+      glDeleteTextures(1, &gl->chain.fbo_feedback_texture);
+   if (gl->chain.fbo_feedback)
+      glDeleteFramebuffers(1, &gl->chain.fbo_feedback);
+   glDeleteTextures(gl->chain.num_fbo_passes, gl->chain.fbo_texture);
+   glDeleteFramebuffers(gl->chain.num_fbo_passes, gl->chain.fbo);
+   gl->chain.num_fbo_passes = 0;
+   return false;
+}
+
+static bool gl3_init_filter_chain_with_path(gl3_t *gl, const char *shader_path)
+{
    enum rarch_shader_type type = video_shader_parse_type(shader_path);
 
    if (string_is_empty(shader_path))
@@ -1847,6 +2387,11 @@ static bool gl3_init_filter_chain(gl3_t *gl)
       gl3_init_default_filter_chain(gl);
 
    return true;
+}
+
+static bool gl3_init_filter_chain(gl3_t *gl)
+{
+   return gl3_init_filter_chain_with_path(gl, video_shader_get_current_shader_preset());
 }
 
 #ifdef GL_DEBUG
@@ -2726,6 +3271,192 @@ static void gl3_draw_menu_texture(gl3_t *gl,
    glDisable(GL_BLEND);
 }
 #endif
+
+static void gl3_update_input_size(gl3_t *gl, unsigned width, unsigned height)
+{
+   float xamt = (float)width  / (RARCH_SCALE_BASE * gl->video_info.input_scale);
+   float yamt = (float)height / (RARCH_SCALE_BASE * gl->video_info.input_scale);
+   GL3_SET_TEXTURE_COORDS(gl->chain.tex_info.coord, xamt, yamt);
+}
+
+static void gl3_renderchain_start_render(
+      gl3_t *gl)
+{
+   /* Used when rendering to an FBO.
+    * Texture coords have to be aligned
+    * with vertex coordinates. */
+   static const GLfloat fbo_vertexes[] = {
+      0, 0,
+      1, 0,
+      0, 1,
+      1, 1
+   };
+   glBindFramebuffer(GL_FRAMEBUFFER, gl->chain.fbo[0]);
+
+   gl3_set_viewport(gl,
+         gl->chain.fbo_rect[0].img_width,
+         gl->chain.fbo_rect[0].img_height, true, false);
+
+   /* Need to preserve the "flipped" state when in FBO
+    * as well to have consistent texture coordinates.
+    *
+    * We will "flip" it in place on last pass. */
+   gl->chain.coords.vertex = fbo_vertexes;
+
+   glEnable(GL_FRAMEBUFFER_SRGB);
+   glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+static void gl3_renderchain_render(
+      gl3_t *gl,
+      uint64_t frame_count,
+      const struct video_tex_info *tex_info,
+      const struct video_tex_info *feedback_info)
+{
+   unsigned i;
+   video_shader_ctx_params_t params;
+   static GLfloat fbo_tex_coords[8] = {0.0f};
+   struct video_tex_info fbo_tex_info[GFX_MAX_SHADERS];
+   struct video_tex_info *fbo_info        = NULL;
+   const struct video_fbo_rect *prev_rect = NULL;
+   GLfloat xamt                           = 0.0f;
+   GLfloat yamt                           = 0.0f;
+   unsigned mip_level                     = 0;
+   unsigned fbo_tex_info_cnt              = 0;
+   unsigned width                         = gl->video_width;
+   unsigned height                        = gl->video_height;
+
+   /* Render the rest of our passes. */
+   gl->chain.coords.tex_coord = fbo_tex_coords;
+
+   /* Calculate viewports, texture coordinates etc,
+    * and render all passes from FBOs, to another FBO. */
+   for (i = 1; i < gl->chain.num_fbo_passes; i++)
+   {
+      const struct video_fbo_rect *rect = &gl->chain.fbo_rect[i];
+
+      prev_rect = &gl->chain.fbo_rect[i - 1];
+      fbo_info  = &fbo_tex_info[i - 1];
+
+      xamt      = (GLfloat)prev_rect->img_width / prev_rect->width;
+      yamt      = (GLfloat)prev_rect->img_height / prev_rect->height;
+
+      GL3_SET_TEXTURE_COORDS(fbo_tex_coords, xamt, yamt);
+
+      fbo_info->tex           = gl->chain.fbo_texture[i - 1];
+      fbo_info->input_size[0] = prev_rect->img_width;
+      fbo_info->input_size[1] = prev_rect->img_height;
+      fbo_info->tex_size[0]   = prev_rect->width;
+      fbo_info->tex_size[1]   = prev_rect->height;
+      memcpy(fbo_info->coord, fbo_tex_coords, sizeof(fbo_tex_coords));
+      fbo_tex_info_cnt++;
+
+      glBindFramebuffer(GL_FRAMEBUFFER, gl->chain.fbo[i]);
+
+      gl->chain.shader->use(gl, gl->chain.shader_data,
+            i + 1, true);
+
+      glBindTexture(GL_TEXTURE_2D, gl->chain.fbo_texture[i - 1]);
+
+      mip_level = i + 1;
+
+      if (gl->chain.shader->mipmap_input(gl->chain.shader_data, mip_level))
+         glGenerateMipmap(GL_TEXTURE_2D);
+
+      glClear(GL_COLOR_BUFFER_BIT);
+
+      /* Render to FBO with certain size. */
+      gl3_set_viewport(gl, rect->img_width, rect->img_height, true, false);
+
+      params.vp_width      = gl->out_vp_width;
+      params.vp_height     = gl->out_vp_height;
+      params.width         = prev_rect->img_width;
+      params.height        = prev_rect->img_height;
+      params.tex_width     = prev_rect->width;
+      params.tex_height    = prev_rect->height;
+      params.out_width     = gl->vp.width;
+      params.out_height    = gl->vp.height;
+      params.frame_counter = (unsigned int)frame_count;
+      params.info          = tex_info;
+      params.prev_info     = gl->chain.prev_info;
+      params.feedback_info = feedback_info;
+      params.fbo_info      = fbo_tex_info;
+      params.fbo_info_cnt  = fbo_tex_info_cnt;
+
+      gl->chain.shader->set_params(&params, gl->chain.shader_data);
+
+      gl->chain.coords.vertices = 4;
+
+      gl->chain.shader->set_coords(gl->chain.shader_data, &gl->chain.coords);
+      gl->chain.shader->set_mvp(gl->chain.shader_data, &gl->mvp);
+
+      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+   }
+
+   glDisable(GL_FRAMEBUFFER_SRGB);
+
+   /* Render our last FBO texture directly to screen. */
+   prev_rect = &gl->chain.fbo_rect[gl->chain.num_fbo_passes - 1];
+   xamt      = (GLfloat)prev_rect->img_width / prev_rect->width;
+   yamt      = (GLfloat)prev_rect->img_height / prev_rect->height;
+
+   GL3_SET_TEXTURE_COORDS(fbo_tex_coords, xamt, yamt);
+
+   /* Push final FBO to list. */
+   fbo_info                = &fbo_tex_info[gl->chain.num_fbo_passes - 1];
+
+   fbo_info->tex           = gl->chain.fbo_texture[gl->chain.num_fbo_passes - 1];
+   fbo_info->input_size[0] = prev_rect->img_width;
+   fbo_info->input_size[1] = prev_rect->img_height;
+   fbo_info->tex_size[0]   = prev_rect->width;
+   fbo_info->tex_size[1]   = prev_rect->height;
+   memcpy(fbo_info->coord, fbo_tex_coords, sizeof(fbo_tex_coords));
+   fbo_tex_info_cnt++;
+
+   /* Render our FBO texture to back buffer. */
+   glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+   gl->chain.shader->use(gl, gl->chain.shader_data,
+         gl->chain.num_fbo_passes + 1, true);
+
+   glBindTexture(GL_TEXTURE_2D, gl->chain.fbo_texture[gl->chain.num_fbo_passes - 1]);
+
+   mip_level = gl->chain.num_fbo_passes + 1;
+
+   if (gl->chain.shader->mipmap_input(gl->chain.shader_data, mip_level))
+      glGenerateMipmap(GL_TEXTURE_2D);
+
+   glClear(GL_COLOR_BUFFER_BIT);
+   gl3_set_viewport(gl, width, height, false, true);
+
+   params.vp_width      = gl->out_vp_width;
+   params.vp_height     = gl->out_vp_height;
+   params.width         = prev_rect->img_width;
+   params.height        = prev_rect->img_height;
+   params.tex_width     = prev_rect->width;
+   params.tex_height    = prev_rect->height;
+   params.out_width     = gl->vp.width;
+   params.out_height    = gl->vp.height;
+   params.frame_counter = (unsigned int)frame_count;
+   params.info          = tex_info;
+   params.prev_info     = gl->chain.prev_info;
+   params.feedback_info = feedback_info;
+   params.fbo_info      = fbo_tex_info;
+   params.fbo_info_cnt  = fbo_tex_info_cnt;
+
+   gl->chain.shader->set_params(&params, gl->chain.shader_data);
+
+   gl->chain.coords.vertex    = gl->chain.vertex_ptr;
+
+   gl->chain.coords.vertices  = 4;
+
+   gl->chain.shader->set_coords(gl->chain.shader_data, &gl->chain.coords);
+   gl->chain.shader->set_mvp(gl->chain.shader_data, &gl->mvp);
+
+   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+   gl->chain.coords.tex_coord = gl->chain.tex_info.coord;
+}
 
 static bool gl3_frame(void *data, const void *frame,
       unsigned frame_width, unsigned frame_height,
