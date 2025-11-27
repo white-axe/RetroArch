@@ -2769,6 +2769,7 @@ static void *gl3_init(const video_info_t *video,
    gl3_t *gl                            = (gl3_t*)calloc(1, sizeof(gl3_t));
    const gfx_ctx_driver_t *ctx_driver   = gl3_get_context(gl);
    struct retro_hw_render_callback *hwr = video_driver_get_hw_context();
+   unsigned i;
 
    if (!gl || !ctx_driver)
       goto error;
@@ -2864,12 +2865,6 @@ static void *gl3_init(const video_info_t *video,
    if (string_is_equal(ctx_driver->ident, "null"))
       goto error;
 
-   if (!gl3_init_pipelines(gl))
-   {
-      RARCH_ERR("[GLCore] Failed to cross-compile menu pipelines.\n");
-      goto error;
-   }
-
    if (!string_is_empty(version))
       sscanf(version, "%u.%u", &gl->version_major, &gl->version_minor);
 
@@ -2924,6 +2919,7 @@ static void *gl3_init(const video_info_t *video,
             input, input_data);
    }
 
+   gl->chain.vertex_ptr = hwr && hwr->bottom_left_origin ? gl3_vertexes : gl3_vertexes_flipped;
    if (!gl3_init_filter_chain(gl))
    {
       RARCH_ERR("[GLCore] Failed to init filter chain.\n");
@@ -3259,34 +3255,26 @@ static bool gl3_set_shader(void *data,
    if (gl->flags & GL3_FLAG_USE_SHARED_CONTEXT)
       gl->ctx_driver->bind_hw_render(gl->ctx_data, false);
 
+#ifdef HAVE_SLANG
    if (gl->filter_chain)
       gl3_filter_chain_free(gl->filter_chain);
-   gl->filter_chain = NULL;
+#endif
 
-   if (!string_is_empty(path) && type != RARCH_SHADER_SLANG)
+   if (gl->chain.shader)
+      gl->chain.shader->deinit(gl->chain.shader_data);
+
+   if (gl->chain.num_fbo_passes)
    {
-      RARCH_WARN("[GLCore] Only Slang shaders are supported. Falling back to stock.\n");
-      path = NULL;
+      glDeleteFramebuffers(gl->chain.num_fbo_passes, gl->chain.fbo);
+      glDeleteTextures(gl->chain.num_fbo_passes, gl->chain.fbo_texture);
    }
 
-   if (string_is_empty(path))
-   {
-      gl3_init_default_filter_chain(gl);
-      goto end;
-   }
-
-   if (!gl3_init_filter_chain_preset(gl, path))
-   {
-      RARCH_ERR("[GLCore] Failed to create filter chain: \"%s\". Falling back to stock.\n", path);
-      gl3_init_default_filter_chain(gl);
-      if (gl->flags & GL3_FLAG_USE_SHARED_CONTEXT)
-         gl->ctx_driver->bind_hw_render(gl->ctx_data, true);
+   if (!gl3_init_filter_chain_with_path(gl, path))
       return false;
-   }
 
-end:
    if (gl->flags & GL3_FLAG_USE_SHARED_CONTEXT)
       gl->ctx_driver->bind_hw_render(gl->ctx_data, true);
+
    return true;
 }
 
