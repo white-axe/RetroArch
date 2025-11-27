@@ -616,137 +616,147 @@ static GLenum gfx_display_prim_to_gl3_enum(
 static void gfx_display_gl3_draw(gfx_display_ctx_draw_t *draw,
       void *data, unsigned video_width, unsigned video_height)
 {
-   const float *vertex       = NULL;
-   const float *tex_coord    = NULL;
-   const float *color        = NULL;
-   GLuint            texture = 0;
    gl3_t *gl                 = (gl3_t*)data;
-   const struct
-      gl3_buffer_locations
-      *loc                   = NULL;
 
    if (!gl || !draw)
       return;
 
-   texture            = (GLuint)draw->texture;
-   vertex             = draw->coords->vertex;
-   tex_coord          = draw->coords->tex_coord;
-   color              = draw->coords->color;
-
-   if (!vertex)
-      vertex          = gfx_display_gl3_get_default_vertices();
-   if (!tex_coord)
-      tex_coord       = &gl3_tex_coords[0];
-   if (!color)
-      color           = &gl3_colors[0];
+   if (!draw->coords->vertex)
+      draw->coords->vertex          = gfx_display_gl3_get_default_vertices();
+   if (!draw->coords->tex_coord)
+      draw->coords->tex_coord       = &gl3_tex_coords[0];
+   if (!draw->coords->color)
+      draw->coords->color           = &gl3_colors[0];
 
    glViewport(draw->x, draw->y, draw->width, draw->height);
 
-   glActiveTexture(GL_TEXTURE1);
-   glBindTexture(GL_TEXTURE_2D, texture);
-
-   switch (draw->pipeline_id)
+   if (gl->chain.active)
    {
-      case VIDEO_SHADER_MENU:
-      case VIDEO_SHADER_MENU_2:
-         glBlendFunc(GL_DST_COLOR, GL_ONE);
-         break;
-      default:
-         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-         break;
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, draw->texture);
+
+      gl->chain.shader->set_coords(gl->chain.shader_data, draw->coords);
+      gl->chain.shader->set_mvp(gl->chain.shader_data,
+            draw->matrix_data ? (math_matrix_4x4*)draw->matrix_data
+         : (math_matrix_4x4*)&gl->mvp_no_rot);
+
+      glDrawArrays(gfx_display_prim_to_gl3_enum(
+               draw->prim_type), 0, draw->coords->vertices);
    }
-
-   switch (draw->pipeline_id)
-   {
-#ifdef HAVE_SHADERPIPELINE
-      case VIDEO_SHADER_MENU:
-         glUseProgram(gl->pipelines.ribbon);
-         loc = &gl->pipelines.ribbon_loc;
-         break;
-
-      case VIDEO_SHADER_MENU_2:
-         glUseProgram(gl->pipelines.ribbon_simple);
-         loc = &gl->pipelines.ribbon_simple_loc;
-         break;
-
-      case VIDEO_SHADER_MENU_3:
-         glUseProgram(gl->pipelines.snow_simple);
-         loc = &gl->pipelines.snow_simple_loc;
-         break;
-
-      case VIDEO_SHADER_MENU_4:
-         glUseProgram(gl->pipelines.snow);
-         loc = &gl->pipelines.snow_loc;
-         break;
-
-      case VIDEO_SHADER_MENU_5:
-         glUseProgram(gl->pipelines.bokeh);
-         loc = &gl->pipelines.bokeh_loc;
-         break;
-#endif
-
-      default:
-         glUseProgram(gl->pipelines.alpha_blend);
-         break;
-   }
-
-   if (loc)
-   {
-      if (loc->flat_ubo_vertex >= 0)
-         glUniform4fv(loc->flat_ubo_vertex,
-               (GLsizei)((draw->backend_data_size + 15) / 16),
-               (const GLfloat*)draw->backend_data);
-
-      if (loc->flat_ubo_fragment >= 0)
-         glUniform4fv(loc->flat_ubo_fragment,
-               (GLsizei)((draw->backend_data_size + 15) / 16),
-               (const GLfloat*)draw->backend_data);
-   }
+#ifdef HAVE_SLANG
    else
    {
-      const math_matrix_4x4 *mat = draw->matrix_data
-                     ? (const math_matrix_4x4*)draw->matrix_data
-                     : (const math_matrix_4x4*)&gl->mvp_no_rot;
-      if (gl->pipelines.alpha_blend_loc.flat_ubo_vertex >= 0)
-         glUniform4fv(gl->pipelines.alpha_blend_loc.flat_ubo_vertex,
-                      4, mat->data);
+      const struct
+         gl3_buffer_locations
+         *loc                   = NULL;
+
+      glActiveTexture(GL_TEXTURE1);
+      glBindTexture(GL_TEXTURE_2D, draw->texture);
+
+      switch (draw->pipeline_id)
+      {
+         case VIDEO_SHADER_MENU:
+         case VIDEO_SHADER_MENU_2:
+            glBlendFunc(GL_DST_COLOR, GL_ONE);
+            break;
+         default:
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            break;
+      }
+
+      switch (draw->pipeline_id)
+      {
+#ifdef HAVE_SHADERPIPELINE
+         case VIDEO_SHADER_MENU:
+            glUseProgram(gl->pipelines.ribbon);
+            loc = &gl->pipelines.ribbon_loc;
+            break;
+
+         case VIDEO_SHADER_MENU_2:
+            glUseProgram(gl->pipelines.ribbon_simple);
+            loc = &gl->pipelines.ribbon_simple_loc;
+            break;
+
+         case VIDEO_SHADER_MENU_3:
+            glUseProgram(gl->pipelines.snow_simple);
+            loc = &gl->pipelines.snow_simple_loc;
+            break;
+
+         case VIDEO_SHADER_MENU_4:
+            glUseProgram(gl->pipelines.snow);
+            loc = &gl->pipelines.snow_loc;
+            break;
+
+         case VIDEO_SHADER_MENU_5:
+            glUseProgram(gl->pipelines.bokeh);
+            loc = &gl->pipelines.bokeh_loc;
+            break;
+#endif /* HAVE_SHADERPIPELINE */
+
+         default:
+            glUseProgram(gl->pipelines.alpha_blend);
+            break;
+      }
+
+      if (loc)
+      {
+         if (loc->flat_ubo_vertex >= 0)
+            glUniform4fv(loc->flat_ubo_vertex,
+                  (GLsizei)((draw->backend_data_size + 15) / 16),
+                  (const GLfloat*)draw->backend_data);
+
+         if (loc->flat_ubo_fragment >= 0)
+            glUniform4fv(loc->flat_ubo_fragment,
+                  (GLsizei)((draw->backend_data_size + 15) / 16),
+                  (const GLfloat*)draw->backend_data);
+      }
+      else
+      {
+         const math_matrix_4x4 *mat = draw->matrix_data
+                        ? (const math_matrix_4x4*)draw->matrix_data
+                        : (const math_matrix_4x4*)&gl->mvp_no_rot;
+         if (gl->pipelines.alpha_blend_loc.flat_ubo_vertex >= 0)
+            glUniform4fv(gl->pipelines.alpha_blend_loc.flat_ubo_vertex,
+                         4, mat->data);
+      }
+
+      glEnableVertexAttribArray(0);
+      glEnableVertexAttribArray(1);
+      glEnableVertexAttribArray(2);
+
+      gl3_bind_scratch_vbo(gl, draw->coords->vertex,
+            2 * sizeof(float) * draw->coords->vertices);
+      glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
+            2 * sizeof(float), (void *)(uintptr_t)0);
+      gl3_bind_scratch_vbo(gl, draw->coords->tex_coord,
+            2 * sizeof(float) * draw->coords->vertices);
+      glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE,
+            2 * sizeof(float), (void *)(uintptr_t)0);
+      gl3_bind_scratch_vbo(gl, draw->coords->color,
+            4 * sizeof(float) * draw->coords->vertices);
+      glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE,
+            4 * sizeof(float), (void *)(uintptr_t)0);
+
+      switch (draw->prim_type)
+      {
+         case GFX_DISPLAY_PRIM_TRIANGLESTRIP:
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, draw->coords->vertices);
+            break;
+         case GFX_DISPLAY_PRIM_TRIANGLES:
+            glDrawArrays(GL_TRIANGLES, 0, draw->coords->vertices);
+            break;
+         case GFX_DISPLAY_PRIM_NONE:
+         default:
+            break;
+      }
+
+      glDisableVertexAttribArray(0);
+      glDisableVertexAttribArray(1);
+      glDisableVertexAttribArray(2);
    }
+#endif /* HAVE_SLANG */
 
-   glEnableVertexAttribArray(0);
-   glEnableVertexAttribArray(1);
-   glEnableVertexAttribArray(2);
-
-   gl3_bind_scratch_vbo(gl, vertex,
-         2 * sizeof(float) * draw->coords->vertices);
-   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
-         2 * sizeof(float), (void *)(uintptr_t)0);
-   gl3_bind_scratch_vbo(gl, tex_coord,
-         2 * sizeof(float) * draw->coords->vertices);
-   glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE,
-         2 * sizeof(float), (void *)(uintptr_t)0);
-   gl3_bind_scratch_vbo(gl, color,
-         4 * sizeof(float) * draw->coords->vertices);
-   glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE,
-         4 * sizeof(float), (void *)(uintptr_t)0);
-
-   switch (draw->prim_type)
-   {
-      case GFX_DISPLAY_PRIM_TRIANGLESTRIP:
-         glDrawArrays(GL_TRIANGLE_STRIP, 0, draw->coords->vertices);
-         break;
-      case GFX_DISPLAY_PRIM_TRIANGLES:
-         glDrawArrays(GL_TRIANGLES, 0, draw->coords->vertices);
-         break;
-      case GFX_DISPLAY_PRIM_NONE:
-      default:
-         break;
-   }
-
-   glDisableVertexAttribArray(0);
-   glDisableVertexAttribArray(1);
-   glDisableVertexAttribArray(2);
    glBindBuffer(GL_ARRAY_BUFFER, 0);
-
    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
