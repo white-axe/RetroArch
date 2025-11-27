@@ -1612,6 +1612,20 @@ static void gl3_destroy_resources(gl3_t *gl)
 #endif
    gl->filter_chain_default = NULL;
 
+   if (gl->chain.shader)
+   {
+      gl->chain.shader->deinit(gl->chain.shader_data);
+      gl->chain.shader      = NULL;
+      gl->chain.shader_data = NULL;
+   }
+
+   if (gl->chain.num_fbo_passes)
+   {
+      glDeleteFramebuffers(gl->chain.num_fbo_passes, gl->chain.fbo);
+      glDeleteTextures(gl->chain.num_fbo_passes, gl->chain.fbo_texture);
+      gl->chain.num_fbo_passes = 0;
+   }
+
    glBindVertexArray(0);
    if (gl->vao != 0)
       glDeleteVertexArrays(1, &gl->vao);
@@ -2493,24 +2507,100 @@ error:
 
 static bool gl3_init_filter_chain_with_path(gl3_t *gl, const char *shader_path)
 {
-   enum rarch_shader_type type = video_shader_parse_type(shader_path);
+   enum rarch_shader_type parse_type = video_shader_parse_type(shader_path);
+   enum rarch_shader_type type       = gl3_get_fallback_shader_type(parse_type);
 
-   if (string_is_empty(shader_path))
+   gl->filter_chain            = NULL;
+   gl->chain.shader            = NULL;
+   gl->chain.shader_data       = NULL;
+   gl->chain.num_fbo_passes    = 0;
+   gl->chain.num_prev_textures = 0;
+#ifdef HAVE_SLANG
+   gl->chain.active = false;
+#else
+   gl->chain.active = true;
+#endif
+   gl->chain.mipmap_active        = false;
+   gl->chain.fbo_feedback_texture = 0;
+
+   if (type == RARCH_SHADER_NONE)
    {
-      RARCH_LOG("[GLCore] Loading stock shader.\n");
-      return gl3_init_default_filter_chain(gl);
+      RARCH_ERR("[GLCore] Couldn't find any supported shader backend! Continuing without shaders.\n");
+      return true;
    }
 
-   if (type != RARCH_SHADER_SLANG)
+   if (type != parse_type)
    {
-      RARCH_WARN("[GLCore] Only Slang shaders are supported, falling back to stock.\n");
-      return gl3_init_default_filter_chain(gl);
+      if (!string_is_empty(shader_path))
+         RARCH_WARN("[GLCore] Shader preset %s is using unsupported shader type %s, falling back to stock %s.\n",
+            shader_path, video_shader_type_to_str(parse_type), video_shader_type_to_str(type));
+
+      shader_path = NULL;
    }
 
-   if (!gl3_init_filter_chain_preset(gl, shader_path))
-      gl3_init_default_filter_chain(gl);
+#ifdef HAVE_GLSL
+   if (type == RARCH_SHADER_GLSL)
+      gl_glsl_set_context_type(true, gl->version_major, gl->version_minor);
+#endif
 
-   return true;
+#ifdef HAVE_SLANG
+   if (type == RARCH_SHADER_SLANG)
+   {
+      RARCH_LOG("[GLCore] Using Slang shader backend.\n");
+
+      gl->chain.active = false;
+
+      if (!gl3_init_pipelines(gl))
+      {
+         RARCH_ERR("[GLCore] Failed to cross-compile menu pipelines.\n");
+         return false;
+      }
+
+      if (string_is_empty(shader_path))
+      {
+         RARCH_LOG("[GLCore] Loading stock shader.\n");
+         return gl3_init_default_filter_chain(gl);
+      }
+      else if (!gl3_init_filter_chain_preset(gl, shader_path))
+         return gl3_init_default_filter_chain(gl);
+      else
+         return true;
+   }
+   else
+#endif
+   {
+      gl3_video_shader_ctx_init_t init_data;
+      bool ret = false;
+
+      gl->chain.active = true;
+
+      init_data.shader_type             = type;
+      init_data.shader                  = NULL;
+      init_data.shader_data             = NULL;
+      init_data.data                    = gl;
+      init_data.path                    = shader_path;
+
+      if (gl3_shader_driver_init(&init_data))
+      {
+         gl->chain.shader               = init_data.shader;
+         gl->chain.shader_data          = init_data.shader_data;
+
+         return gl3_create_fbo_targets(gl);
+      }
+
+      RARCH_ERR("[GLCore] Failed to initialize shader, falling back to stock.\n");
+
+      init_data.shader                  = NULL;
+      init_data.shader_data             = NULL;
+      init_data.path                    = NULL;
+
+      ret                               = gl3_shader_driver_init(&init_data);
+
+      gl->chain.shader                  = init_data.shader;
+      gl->chain.shader_data             = init_data.shader_data;
+
+      return ret && gl3_create_fbo_targets(gl);
+   }
 }
 
 static bool gl3_init_filter_chain(gl3_t *gl)
